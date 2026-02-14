@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+
+# Environment
+.env
+.env.local
+.env.development
+
+# Logs & temp
+logs/
+*.log
+temp/
+*.tmp
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
+*.swp
