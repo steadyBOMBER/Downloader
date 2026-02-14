@@ -1,0 +1,5 @@
+aiogram[fast]
+yt-dlp
+python-dotenv
+fastapi
+uvicorn[standard]
