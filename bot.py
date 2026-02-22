@@ -1,6 +1,3 @@
-# Python 3.10+
-# pip install aiogram[fast] yt-dlp python-dotenv fastapi uvicorn[standard]
-
 import asyncio
 import logging
 import random
@@ -8,24 +5,24 @@ import string
 import os
 import tempfile
 import time
-import socket
-from collections import defaultdict
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Dict, Any
+from collections import defaultdict
 
 from dotenv import load_dotenv
 
-from aiogram import Bot, Dispatcher, types, F, BaseMiddleware
+from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import FSInputFile, InputMediaVideo, InputMediaAudio, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import FSInputFile, InputMediaVideo, InputMediaAudio, InlineKeyboardButton
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 
 from yt_dlp import YoutubeDL
+from yt_dlp.version import __version__ as ytdlp_version
 
 # ─── Keep-alive server ─────────────────────────────────────
 import uvicorn
@@ -44,18 +41,16 @@ bot = Bot(token=API_TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 
-MAX_MEDIA_GROUP = 8
-MAX_SINGLE_SIZE_MB = 48
-RATE_LIMIT_SECONDS = 60  # 1 request per minute per user
-QUEUE_WARNING = "You're already downloading. This link is added to queue (processed in order)."
+MAX_MEDIA_GROUP     = 10
+MAX_SINGLE_SIZE_MB  = 45     # safe value under Telegram bots' 50 MB upload limit
+MAX_QUEUE_SIZE      = 5
+RATE_LIMIT_SECONDS  = 60
 
-# ─── FastAPI keep-alive app ────────────────────────────────
+# ─── FastAPI keep-alive ────────────────────────────────────
 
 keepalive_app = FastAPI(
     title="Telegram Downloader Keep-Alive",
-    docs_url=None,
-    redoc_url=None,
-    openapi_url=None
+    docs_url=None, redoc_url=None, openapi_url=None
 )
 
 @keepalive_app.get("/", response_class=PlainTextResponse)
@@ -69,8 +64,8 @@ async def ping():
 # ─── States ────────────────────────────────────────────────
 
 class DownloadState(StatesGroup):
-    waiting = State()      # has pending downloads
-    downloading = State()  # currently processing one
+    waiting     = State()
+    downloading = State()
 
 # ─── Per-user data ─────────────────────────────────────────
 
@@ -79,13 +74,8 @@ user_last_action: Dict[int, datetime] = {}
 
 # ─── Throttling Middleware ─────────────────────────────────
 
-class ThrottlingMiddleware(BaseMiddleware):
-    async def __call__(
-        self,
-        handler,
-        event: types.TelegramObject,
-        data: Dict[str, Any]
-    ):
+class ThrottlingMiddleware:
+    async def __call__(self, handler, event: types.TelegramObject, data: Dict[str, Any]):
         if not isinstance(event, types.Message):
             return await handler(event, data)
 
@@ -96,7 +86,7 @@ class ThrottlingMiddleware(BaseMiddleware):
             delta = now - user_last_action[user_id]
             if delta < timedelta(seconds=RATE_LIMIT_SECONDS):
                 remaining = RATE_LIMIT_SECONDS - int(delta.total_seconds())
-                await event.reply(f"⏳ Wait {remaining}s before new request.")
+                await event.reply(f"⏳ Please wait {remaining} seconds before next request.")
                 return
 
         user_last_action[user_id] = now
@@ -115,129 +105,141 @@ def make_progress_bar(percentage: float, width: int = 10) -> str:
 
 async def is_supported_url(url: str) -> bool:
     domains = ["youtube.com", "youtu.be", "tiktok.com", "instagram.com", "twitter.com", "x.com"]
-    return any(d in url.lower() for d in domains)
+    return any(domain in url.lower() for domain in domains)
 
 # ─── Start & URL handler ───────────────────────────────────
 
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
     await message.answer(
-        "🎥 Video/Audio downloader\n\n"
-        "Send YouTube / TikTok / Instagram / X link\n"
-        f"Limit: ~{MAX_SINGLE_SIZE_MB} MB per file • 1 download/min"
+        "🎥 Video / Audio Downloader Bot\n\n"
+        "Send a link from:\n"
+        "• YouTube\n"
+        "• TikTok\n"
+        "• Instagram\n"
+        "• Twitter/X\n\n"
+        f"• Max file size: ~{MAX_SINGLE_SIZE_MB} MB (Telegram bot limit)\n"
+        f"• Cooldown: 1 request / {RATE_LIMIT_SECONDS} seconds\n"
+        f"• yt-dlp version: {ytdlp_version}\n\n"
+        "Just send a link and choose format!"
     )
 
 @dp.message()
 async def handle_url(message: types.Message, state: FSMContext):
     text = message.text.strip()
-    url = text if not text.startswith("/") else (text.split(maxsplit=1)[1].strip() if len(text.split()) > 1 else "")
-
-    if not url or not await is_supported_url(url):
-        await message.reply("Supported: YouTube, TikTok, Instagram, Twitter/X.\nSend valid link.")
+    if not text or text.startswith("/"):
         return
 
-    await state.update_data(url=url)
+    if not await is_supported_url(text):
+        await message.reply("Only YouTube, TikTok, Instagram, Twitter/X links are supported.")
+        return
+
+    await state.update_data(url=text)
 
     builder = InlineKeyboardBuilder()
     builder.row(
         InlineKeyboardButton(text="🎥 Video", callback_data="dl:video"),
-        InlineKeyboardButton(text="🎵 Audio", callback_data="dl:audio"),
+        InlineKeyboardButton(text="🎵 Audio",  callback_data="dl:audio"),
     )
     builder.row(
-        InlineKeyboardButton(text="🖼️ Thumbnail", callback_data="dl:thumb"),
         InlineKeyboardButton(text="❌ Cancel", callback_data="dl:cancel")
     )
 
-    await message.reply("What do you want?", reply_markup=builder.as_markup())
+    await message.reply("Choose what you want:", reply_markup=builder.as_markup())
 
 # ─── Callback processor ────────────────────────────────────
 
 @dp.callback_query(F.data.startswith("dl:"))
 async def process_callback(callback: types.CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
     data = await state.get_data()
     url = data.get("url")
 
-    parts = callback.data.split(":")
-    if len(parts) < 2:
-        await callback.answer("Error", show_alert=True)
+    if not url:
+        await callback.answer("No link found. Please send a link again.", show_alert=True)
         return
 
-    mode = parts[1]
+    action = callback.data.split(":", 1)[1]
 
-    if mode == "cancel":
+    if action == "cancel":
         await state.clear()
         await callback.message.edit_text("Cancelled.")
         await callback.answer()
         return
 
-    if not url:
-        await callback.answer("No URL saved", show_alert=True)
-        return
-
-    user_id = callback.from_user.id
-
-    # Video format selection
-    if mode == "video":
+    # Video quality selection
+    if action == "video":
         builder = InlineKeyboardBuilder()
         builder.row(
             InlineKeyboardButton(text="720p (recommended)", callback_data="fmt:720"),
-            InlineKeyboardButton(text="1080p", callback_data="fmt:1080"),
+            InlineKeyboardButton(text="1080p",              callback_data="fmt:1080"),
         )
         builder.row(
-            InlineKeyboardButton(text="Best (may be large)", callback_data="fmt:best"),
+            InlineKeyboardButton(text="480p (smaller file)", callback_data="fmt:480"),
+            InlineKeyboardButton(text="360p (smallest)",     callback_data="fmt:360"),
+        )
+        builder.row(
+            InlineKeyboardButton(text="Best (may exceed limit)", callback_data="fmt:best"),
             InlineKeyboardButton(text="❌ Cancel", callback_data="dl:cancel")
         )
         await callback.message.edit_text("Choose video quality:", reply_markup=builder.as_markup())
         await callback.answer()
         return
 
-    # Format chosen → start download
-    if parts[0] == "fmt":
-        quality = parts[1]
-        await state.update_data(quality=quality)
+    # Format selected → add to queue
+    quality = None
+    mode = action
+    if action.startswith("fmt:"):
+        quality = action.split(":", 1)[1]
         mode = "video"
 
     queue = user_queues[user_id]
 
-    current_state = await state.get_state()
-    if current_state in [DownloadState.waiting.state, DownloadState.downloading.state]:
-        await queue.put((mode, url, quality if mode == "video" else None))
-        await callback.message.edit_text(QUEUE_WARNING)
+    if queue.qsize() >= MAX_QUEUE_SIZE:
+        await callback.message.edit_text(f"⚠️ Queue full (max {MAX_QUEUE_SIZE} items). Wait for current downloads to finish.")
         await callback.answer()
         return
 
-    await state.set_state(DownloadState.downloading)
-    await queue.put((mode, url, quality if mode == "video" else None))
-    asyncio.create_task(process_user_queue(user_id, callback.message, state))
+    current_state = await state.get_state()
+    is_already_running = current_state in [DownloadState.waiting.state, DownloadState.downloading.state]
+
+    await queue.put((mode, url, quality))
+
+    if is_already_running:
+        await callback.message.edit_text("Added to queue (processed in order).")
+    else:
+        await state.set_state(DownloadState.downloading)
+        asyncio.create_task(process_user_queue(user_id, callback.message, state))
 
     await callback.answer()
 
 # ─── Queue processor ───────────────────────────────────────
 
-async def process_user_queue(user_id: int, original_msg: types.Message, state: FSMContext):
+async def process_user_queue(user_id: int, msg: types.Message, state: FSMContext):
     queue = user_queues[user_id]
 
     while not queue.empty():
+        mode, url, quality = await queue.get()
+
         try:
-            mode, url, quality = await queue.get()
-
-            await original_msg.edit_text(f"🔄 Queue position: {queue.qsize() + 1}\nStarting {mode.upper()}...")
-
-            await process_content(url, mode, original_msg, user_id, quality)
-
+            remaining = queue.qsize()
+            await msg.edit_text(
+                f"Processing {mode.upper()}...\n"
+                f"{'Remaining in queue: ' + str(remaining) if remaining > 0 else 'Last item'}"
+            )
+            await process_content(url, mode, msg, user_id, quality)
         except Exception as e:
-            logging.exception("Queue item error")
+            logging.exception("Processing failed")
             try:
-                await original_msg.answer(f"Error in queued item: {str(e)[:120]}")
+                await msg.answer(f"Error: {str(e)[:180]}")
             except:
                 pass
-
         finally:
             queue.task_done()
 
     await state.clear()
     try:
-        await original_msg.edit_text("✅ All downloads processed!")
+        await msg.edit_text("✅ All downloads completed!")
     except:
         pass
 
@@ -253,16 +255,23 @@ class ProgressTracker:
         if d['status'] != 'downloading':
             return
         try:
-            pct = float(d.get('_percent_str', '0%').rstrip('%'))
-            if abs(pct - self.last_pct) < 2 and (time.time() - self.last_update) < 2:
+            pct_str = d.get('_percent_str', '0%')
+            pct = float(pct_str.rstrip('%')) if pct_str else 0.0
+
+            if abs(pct - self.last_pct) < 2 and (time.time() - self.last_update) < 3:
                 return
 
             bar = make_progress_bar(pct)
-            text = f"📥 {bar} {pct:.1f}%\n⚡ {d.get('_speed_str', '?')}\n⏳ {d.get('_eta_str', '?')}"
+            text = f"📥 {bar} {pct:.1f}%"
+            if '_speed_str' in d:
+                text += f" • {d['_speed_str']}"
+            if '_eta_str' in d:
+                text += f" • ETA {d['_eta_str']}"
+
             await self.msg.edit_text(text)
             self.last_pct = pct
             self.last_update = time.time()
-        except:
+        except Exception:
             pass
 
 async def process_content(url: str, mode: str, msg: types.Message, user_id: int, quality: str = None):
@@ -277,14 +286,31 @@ async def process_content(url: str, mode: str, msg: types.Message, user_id: int,
     }
 
     if is_audio:
-        ydl_opts["format"] = "bestaudio/best"
-        ydl_opts["postprocessors"] = [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}]
+        ydl_opts.update({
+            "format": "bestaudio/best",
+            "postprocessors": [{
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": "192",
+            }],
+        })
     else:
-        height_map = {"720": 720, "1080": 1080, "best": None}
-        max_h = height_map.get(quality, 1080)
-        fmt = f"bestvideo[height<={max_h}][ext=mp4]+bestaudio[ext=m4a]/best[height<={max_h}][ext=mp4]/best" if max_h else "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
-        ydl_opts["format"] = fmt
-        ydl_opts["merge_output_format"] = "mp4"
+        height_map = {
+            "360": 360,
+            "480": 480,
+            "720": 720,
+            "1080": 1080,
+            "best": None
+        }
+        max_h = height_map.get(quality, 720)  # default to 720p if quality missing
+        if max_h:
+            fmt = f"bestvideo[height<={max_h}][ext=mp4]+bestaudio[ext=m4a]/best[height<={max_h}][ext=mp4]/best[ext=mp4]/best"
+        else:
+            fmt = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
+        ydl_opts.update({
+            "format": fmt,
+            "merge_output_format": "mp4",
+        })
 
     temp_paths = []
 
@@ -295,71 +321,97 @@ async def process_content(url: str, mode: str, msg: types.Message, user_id: int,
 
             if is_playlist:
                 entries = list(info['entries'])[:MAX_MEDIA_GROUP]
-                await msg.edit_text(f"Playlist: {len(info['entries'])} items → taking first {len(entries)}")
+                await msg.edit_text(f"Playlist detected → processing first {len(entries)} items")
                 medias = []
-                for i, e in enumerate(entries, 1):
-                    tmp = await download_single(e, ydl, is_audio)
-                    temp_paths.append(tmp["path"])
-                    if tmp["size_mb"] > MAX_SINGLE_SIZE_MB:
-                        await msg.answer(f"Skipped #{i} — too big ({tmp['size_mb']:.1f} MB)")
+                for i, entry in enumerate(entries, 1):
+                    path_info = await download_single(entry, ydl, is_audio)
+                    temp_paths.append(path_info["path"])
+
+                    if path_info["size_mb"] > MAX_SINGLE_SIZE_MB:
+                        await msg.answer(f"#{i} skipped — too large ({path_info['size_mb']:.1f} MB)")
                         continue
-                    caption = f"#{i} • {e.get('title','?')[:80]}\n🕒 {e.get('duration_string','?')}"
+
+                    caption = f"#{i} • {entry.get('title', '?')[:80]}\n🕒 {entry.get('duration_string', '?')}"
                     if is_audio:
-                        medias.append(InputMediaAudio(media=FSInputFile(tmp["path"]), caption=caption))
+                        medias.append(InputMediaAudio(media=FSInputFile(path_info["path"]), caption=caption))
                     else:
-                        medias.append(InputMediaVideo(media=FSInputFile(tmp["path"]), caption=caption, supports_streaming=True))
+                        medias.append(InputMediaVideo(media=FSInputFile(path_info["path"]), caption=caption, supports_streaming=True))
+
                 if medias:
                     await msg.answer_media_group(medias)
+
             else:
-                tmp = await download_single(info, ydl, is_audio)
-                temp_paths.append(tmp["path"])
-                if tmp["size_mb"] > MAX_SINGLE_SIZE_MB:
-                    await msg.edit_text(f"Too large ({tmp['size_mb']:.1f} MB)")
+                path_info = await download_single(info, ydl, is_audio)
+                temp_paths.append(path_info["path"])
+
+                if path_info["size_mb"] > MAX_SINGLE_SIZE_MB:
+                    await msg.edit_text(
+                        f"File too large ({path_info['size_mb']:.1f} MB).\n"
+                        "Try a lower quality (360p or 480p) or a shorter video."
+                    )
                     return
-                caption = f"{'🎵' if is_audio else '🎬'} {info.get('title','?')[:90]}\n🕒 {info.get('duration_string','?')}\n📏 ~{tmp['size_mb']:.1f} MB"
+
+                caption = (
+                    f"{'🎵' if is_audio else '🎬'} {info.get('title', '?')[:90]}\n"
+                    f"🕒 {info.get('duration_string', '?')}\n"
+                    f"📏 ~{path_info['size_mb']:.1f} MB"
+                )
                 if is_audio:
-                    await msg.answer_audio(FSInputFile(tmp["path"]), caption=caption, filename=random_filename("mp3"))
+                    await msg.answer_audio(
+                        FSInputFile(path_info["path"]),
+                        caption=caption,
+                        filename=random_filename("mp3")
+                    )
                 else:
-                    await msg.answer_video(FSInputFile(tmp["path"]), caption=caption, supports_streaming=True, filename=random_filename("mp4"))
+                    await msg.answer_video(
+                        FSInputFile(path_info["path"]),
+                        caption=caption,
+                        supports_streaming=True,
+                        filename=random_filename("mp4")
+                    )
 
     finally:
-        for p in temp_paths:
-            if os.path.exists(p):
-                try: os.remove(p)
-                except: pass
+        for p_str in temp_paths:
+            p = Path(p_str)
+            try:
+                if p.exists():
+                    p.unlink(missing_ok=True)
+            except Exception:
+                pass
 
-async def download_single(info, ydl, is_audio):
+async def download_single(info, ydl, is_audio: bool):
     ext = "mp3" if is_audio else "mp4"
-    with tempfile.NamedTemporaryFile(suffix=f".{ext}", delete=False) as tf:
-        path = tf.name
-    ydl.params["outtmpl"] = path
-    ydl.download([info["webpage_url"] or info["url"]])
-    return {"path": path, "size_mb": os.path.getsize(path) / (1024**2)}
+    fd, temp_path_str = tempfile.mkstemp(suffix=f".{ext}")
+    os.close(fd)
+    temp_path = Path(temp_path_str)
+
+    try:
+        ydl.params["outtmpl"] = str(temp_path)
+        ydl.download([info.get("webpage_url") or info["url"]])
+
+        if not temp_path.exists() or temp_path.stat().st_size == 0:
+            raise RuntimeError("Downloaded file is empty or missing")
+
+        return {
+            "path": str(temp_path),
+            "size_mb": temp_path.stat().st_size / (1024 ** 2)
+        }
+
+    except Exception as e:
+        if temp_path.exists():
+            temp_path.unlink(missing_ok=True)
+        raise e
 
 # ─── Keep-alive server runner ──────────────────────────────
 
 async def run_keepalive_server():
     port = int(os.getenv("PORT", 8000))
-    host = "0.0.0.0"
-
-    print(f"[Keep-alive] Starting HTTP server on {host}:{port}")
-
-    # Optional: log detected outbound IP (useful for debugging)
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        print(f"[Keep-alive] Detected outbound IP: {s.getsockname()[0]}")
-        s.close()
-    except Exception:
-        print("[Keep-alive] Could not detect outbound IP")
-
     config = uvicorn.Config(
         keepalive_app,
-        host=host,
+        host="0.0.0.0",
         port=port,
         log_level="info",
         workers=1,
-        timeout_keep_alive=120,
     )
     server = uvicorn.Server(config)
     await server.serve()
@@ -367,14 +419,12 @@ async def run_keepalive_server():
 # ─── Main ──────────────────────────────────────────────────
 
 async def main():
-    # Start keep-alive HTTP server in background
+    print(f"[Bot] Starting • yt-dlp {ytdlp_version}")
     asyncio.create_task(run_keepalive_server())
-
-    print("[Bot] Starting aiogram polling...")
     await dp.start_polling(
         bot,
         allowed_updates=["message", "callback_query"],
-        drop_pending_updates=True  # clean start
+        drop_pending_updates=True
     )
 
 if __name__ == "__main__":
