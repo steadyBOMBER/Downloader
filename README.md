@@ -1,5 +1,4 @@
-Here is a complete, modern, and well-structured README.md in Markdown format for your GitHub repository. This README is tailored to your Telegram bot project (aiogram + yt-dlp downloader for YouTube/TikTok/Instagram/X with queue, progress, cookies support, no-watermark TikTok preference, etc.).
-Copy-paste this content into your repository’s README.md file.
+
 # Telegram Media Downloader Bot 🎥🎵
 
 **A powerful, self-hosted Telegram bot** that lets users download videos and audio from **YouTube, TikTok, Instagram, Twitter/X** (and many more sites via yt-dlp).
